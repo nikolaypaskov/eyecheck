@@ -22,10 +22,12 @@ pub async fn run(
     render_path: &str,
     threshold: f64,
     output_path: Option<&str>,
+    ignore_antialiasing: bool,
     context: Option<&str>,
 ) -> Result<EyecheckReport> {
     // Run structural comparison
-    let compare_result = compare::run(reference_path, render_path, threshold, output_path)?;
+    let compare_result =
+        compare::run(reference_path, render_path, threshold, output_path, ignore_antialiasing)?;
 
     // Run semantic analysis
     let analyze_result = analyze::run(reference_path, render_path, context).await?;

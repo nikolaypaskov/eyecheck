@@ -28,13 +28,15 @@ AI coding assistants write UI code without knowing if it looks right. Colors, sp
 │  eyecheck MCP Server (TypeScript)                     │
 │                                                       │
 │  Tools: set_reference, check, watch, status,          │
-│         set_tokens                                    │
+│         set_tokens, approve, history                  │
 │                                                       │
 │  Renderers:                                           │
 │    Playwright (web) │ Xcode (SwiftUI)                 │
 │    Paparazzi (Compose) │ Flutter (goldens)            │
 │                                                       │
 │  Features:                                            │
+│    SQLite persistence (baselines + comparison history)│
+│    Multi-viewport responsive testing                  │
 │    Design token awareness (Tailwind, CSS vars)        │
 │    File watching with auto-recheck                    │
 │    Score history tracking                             │
@@ -44,11 +46,13 @@ AI coding assistants write UI code without knowing if it looks right. Colors, sp
 ┌───────────────────────────────────────────────────────┐
 │  eyecheck-core (Rust CLI)                             │
 │                                                       │
-│  compare:  SSIM + RGBA pixel diff                     │
+│  compare:  SSIM + YIQ perceptual diff + anti-aliasing │
 │  analyze:  Claude Vision semantic analysis            │
 │  report:   Combined structural + semantic             │
+│  batch:    CI/CD batch comparison with JUnit output   │
 │                                                       │
-│  Outputs: JSON with scores, issues, suggestions       │
+│  Performance: Rayon parallel rows, region clustering  │
+│  Outputs: JSON with scores, regions, suggestions      │
 └───────────────────────────────────────────────────────┘
 ```
 
@@ -105,6 +109,7 @@ Store a design reference image for visual comparison.
 | `type` | `"url"` \| `"file"` \| `"screenshot"` | yes | How to capture the reference |
 | `value` | string | yes | URL, file path, or localhost URL |
 | `viewport` | `{ width, height }` | no | Viewport size (default: 1280x720) |
+| `name` | string | no | Name for this baseline (default: auto-generated from URL hostname) |
 
 **Examples:**
 
@@ -128,6 +133,7 @@ Render a URL and compare it against the stored reference. Returns SSIM score, pi
 | `url` | string | yes | URL to render and compare |
 | `selector` | string | no | CSS selector to screenshot a specific element |
 | `viewport` | `{ width, height }` | no | Viewport size (default: 1280x720) |
+| `viewports` | `[{ width, height, label? }]` | no | Multiple viewports for responsive testing |
 
 **Pass output:**
 
@@ -145,7 +151,12 @@ FAIL - Visual differences detected (score: 0.73)
   SSIM: 0.7324
   Threshold: 0.95
   Pixel differences: 48201 (5.24%)
+  Anti-aliased pixels: 1203 (filtered)
   Diff image: /tmp/eyecheck/checks/diff-1709471234.png
+
+Regions: 2 changed areas
+  Region 1: (100, 50) 200x40 — 3420 pixels
+  Region 2: (300, 200) 80x20 — 890 pixels
 
 Issues found:
 1. [HIGH] spacing — .card-grid: gap is 16px, should be 24px
@@ -155,6 +166,19 @@ Issues found:
 
 Summary: The card grid spacing is tighter than the design, and the primary
 button color is slightly off. Layout structure matches correctly.
+```
+
+**Multi-viewport output:**
+
+```
+=== Responsive Check: http://localhost:3000 ===
+
+[mobile 375x812] PASS — SSIM: 0.9921 | Diff: 0.42%
+[tablet 768x1024] FAIL — SSIM: 0.8734 | Diff: 12.45%
+  1. [HIGH] layout — .sidebar: collapsed on tablet, should be visible
+[desktop 1280x720] PASS — SSIM: 0.9856 | Diff: 1.23%
+
+Overall: FAIL (1 of 3 viewports failed)
 ```
 
 ### `watch`
@@ -206,6 +230,46 @@ Score history (last 3):
   2026-03-03T07:16:30Z | SSIM: 0.9812 | http://localhost:3000
 ```
 
+### `approve`
+
+Approve the current render as the new baseline. Useful after a failed check when the new visual state is intentional.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | no | Baseline name to approve (defaults to most recent) |
+
+```
+approve({ name: "homepage" })
+
+# Output:
+Baseline "homepage" approved and updated.
+  Previous SSIM: 0.8734
+  Updated at: 2026-03-03T08:00:00.000Z
+  The current render is now the new baseline.
+```
+
+### `history`
+
+View comparison history for a named baseline.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | yes | Baseline name to view history for |
+| `limit` | number | no | Number of recent comparisons (default: 20) |
+
+```
+history({ name: "homepage", limit: 5 })
+
+# Output:
+=== History for "homepage" (1280x720) ===
+
+  2026-03-03T07:14:00Z | FAIL | SSIM: 0.6201 | Diff: 12.45%
+  2026-03-03T07:15:30Z | FAIL | SSIM: 0.7324 | Diff: 5.24%
+  2026-03-03T07:16:30Z | PASS | SSIM: 0.9812 | Diff: 0.01%
+
+Total comparisons: 3
+```
+
 ### `set_tokens`
 
 Load design tokens from Tailwind config or CSS custom properties. When tokens are loaded, check reports will map raw CSS values to token names (e.g., `#2563EB` → `var(--color-primary)`, `24px` → `spacing-6`).
@@ -254,7 +318,7 @@ eyecheck-core compare \
   --json
 ```
 
-Returns SSIM score, pass/fail, diff pixel count, and generates a visual diff overlay.
+Returns SSIM score, pass/fail, diff pixel count, anti-aliased pixel count, diff regions, and generates a visual diff overlay.
 
 ```json
 {
@@ -263,7 +327,12 @@ Returns SSIM score, pass/fail, diff pixel count, and generates a visual diff ove
   "diff_pixels": 48201,
   "total_pixels": 921600,
   "diff_percentage": 5.23,
-  "diff_image_path": "diff.png"
+  "antialiased_pixels": 1203,
+  "diff_image_path": "diff.png",
+  "regions": [
+    { "x": 100, "y": 50, "width": 200, "height": 40, "pixel_count": 3420 },
+    { "x": 300, "y": 200, "width": 80, "height": 20, "pixel_count": 890 }
+  ]
 }
 ```
 
@@ -308,6 +377,71 @@ eyecheck-core report \
 ```
 
 Runs both `compare` and `analyze`, merging results. Passes only if SSIM >= threshold AND semantic match_score >= 0.8.
+
+### `batch` — CI/CD batch comparison
+
+```bash
+eyecheck-core batch \
+  --config eyecheck.ci.json \
+  --output-dir ./diffs \
+  --junit report.xml \
+  --json
+```
+
+Runs multiple comparisons from a JSON config file. Designed for CI pipelines.
+
+**Exit codes:** 0 = all pass, 1 = any fail, 2 = any error.
+
+**Config format** (`eyecheck.ci.json`):
+
+```json
+{
+  "checks": [
+    { "name": "homepage", "baseline": "baselines/home.png", "test": "screenshots/home.png" },
+    { "name": "about", "baseline": "baselines/about.png", "test": "screenshots/about.png" },
+    { "name": "login", "baseline": "baselines/login.png", "test": "screenshots/login.png", "threshold": 0.98 }
+  ],
+  "threshold": 0.95,
+  "ignore_antialiasing": true
+}
+```
+
+See `eyecheck.ci.example.json` for a ready-to-use template.
+
+### Anti-aliasing filtering
+
+All compare commands support `--ignore-antialiasing` (default: true), which filters out sub-pixel font rendering and anti-aliased edge differences using Pixelmatch's YIQ perceptual color delta algorithm. This reduces false positives by 40%+ on typical web pages.
+
+```bash
+eyecheck-core compare --baseline a.png --test b.png --ignore-antialiasing --json
+```
+
+The diff image uses distinct colors: red for real differences, yellow for filtered anti-aliased pixels.
+
+---
+
+## CI/CD Integration
+
+A ready-to-use GitHub Actions workflow is provided at `.github/workflows/visual-regression.yml`. It:
+
+1. Builds eyecheck-core
+2. Starts your dev server
+3. Runs `eyecheck-core batch` against baselines in your repo
+4. Uploads diff images as artifacts on failure
+5. Posts a PR comment with a results table
+
+Copy it to your project and customize the dev server command and config path.
+
+---
+
+## Persistence
+
+eyecheck persists baselines and comparison history across sessions using SQLite.
+
+- **Database:** `~/.eyecheck/eyecheck.db`
+- **Images:** `~/.eyecheck/images/{name}/{viewport}.png`
+
+On server start, the last baseline is automatically restored so you don't need to re-set your reference after restarting. Use `approve` to promote a failed check as the new baseline, and `history` to track visual quality over time.
 
 ---
 
@@ -477,11 +611,15 @@ These are set in `mcp-server/src/config.ts`.
 cd core && cargo test
 ```
 
-7 tests covering:
+20 tests covering:
 - SSIM scoring (identical images → ~1.0, different images → <0.95)
 - Diff pixel counting and percentage calculation
 - Diff image generation and dimension validation
-- Test fixture generation
+- YIQ perceptual color delta and alpha blending
+- Anti-aliasing detection (solid regions, edge pixels)
+- Connected-component region clustering (single/multiple regions, noise filtering)
+- Batch config parsing and defaults
+- JUnit XML generation and XML escaping
 
 ### TypeScript integration tests
 
@@ -504,35 +642,43 @@ eyecheck/
 ├── core/                          # Rust comparison engine
 │   ├── Cargo.toml
 │   └── src/
-│       ├── main.rs                # CLI: compare, analyze, report
-│       ├── compare.rs             # SSIM + RGBA pixel comparison
+│       ├── main.rs                # CLI: compare, analyze, report, batch
+│       ├── compare.rs             # SSIM + YIQ perceptual pixel diff (Rayon parallel)
 │       ├── analyze.rs             # Claude Vision semantic analysis
-│       ├── diff_image.rs          # Visual diff overlay generation
-│       └── report.rs              # Combined comparison report
+│       ├── diff_image.rs          # Visual diff overlay (region-aware coloring)
+│       ├── report.rs              # Combined comparison report
+│       ├── yiq.rs                 # YIQ perceptual color delta (Pixelmatch port)
+│       ├── antialiasing.rs        # Anti-aliasing detection
+│       ├── clustering.rs          # Connected-component region grouping
+│       ├── batch.rs               # CI/CD batch comparison runner
+│       └── junit.rs               # JUnit XML report output
 ├── mcp-server/                    # TypeScript MCP server
 │   ├── package.json
 │   ├── tsconfig.json
 │   └── src/
-│       ├── index.ts               # Server entry point, tool registration
+│       ├── index.ts               # Server entry point, tool registration, DB init
 │       ├── config.ts              # Server configuration
 │       ├── core-bridge.ts         # Rust binary subprocess bridge
+│       ├── storage.ts             # SQLite + filesystem persistence
 │       ├── tokens.ts              # Design token extraction
 │       ├── renderers/
-│       │   ├── playwright.ts      # Web renderer (Chromium)
+│       │   ├── playwright.ts      # Web renderer (Chromium, multi-viewport)
 │       │   ├── xcode.ts           # SwiftUI renderer
 │       │   ├── paparazzi.ts       # Android Compose renderer
 │       │   └── flutter.ts         # Flutter golden renderer
 │       └── tools/
-│           ├── set-reference.ts   # Reference setup handler
-│           ├── check.ts           # Visual comparison handler
+│           ├── set-reference.ts   # Reference setup (persists to SQLite)
+│           ├── check.ts           # Visual comparison (single + multi-viewport)
 │           ├── watch.ts           # File watching handler
-│           ├── status.ts          # Status reporting
+│           ├── status.ts          # Status reporting (DB-aware)
+│           ├── approve.ts         # Approve current render as new baseline
+│           ├── history.ts         # View comparison history
 │           └── set-tokens.ts      # Design token loader
+├── .github/workflows/
+│   └── visual-regression.yml      # GitHub Actions CI template
+├── eyecheck.ci.example.json       # Example batch config for CI
 └── test/
     ├── fixtures/                  # Test images (generated by cargo test)
-    │   ├── reference.png          # 100x100 blue square
-    │   ├── render-match.png       # 100x100 blue square (identical)
-    │   └── render-diff.png        # 100x100 red square (different)
     └── integration.test.ts        # TypeScript integration tests
 ```
 

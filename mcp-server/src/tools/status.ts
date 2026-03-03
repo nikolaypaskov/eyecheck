@@ -1,4 +1,5 @@
 import type { ServerState } from "../index.js";
+import { listBaselines, getLatestComparison } from "../storage.js";
 
 export async function handleStatus(state: ServerState): Promise<string> {
   const lines: string[] = ["=== eyecheck status ===", ""];
@@ -50,6 +51,31 @@ export async function handleStatus(state: ServerState): Promise<string> {
     }
   } else {
     lines.push("Score history: Empty");
+  }
+  lines.push("");
+
+  // Baselines from DB
+  const baselines = listBaselines();
+  if (baselines.length > 0) {
+    lines.push(`Baselines: ${baselines.length} stored`);
+    for (const b of baselines) {
+      lines.push(`  ${b.name} (${b.viewport_width}x${b.viewport_height}) — updated ${b.updated_at}`);
+    }
+  } else {
+    lines.push("Baselines: None stored");
+  }
+  lines.push("");
+
+  // Last DB comparison
+  const latestComp = getLatestComparison();
+  if (latestComp) {
+    lines.push("Last DB comparison:");
+    lines.push(`  Result: ${latestComp.passed ? "PASS" : "FAIL"}`);
+    lines.push(`  SSIM: ${latestComp.ssim_score?.toFixed(4) ?? "N/A"}`);
+    lines.push(`  Diff: ${latestComp.diff_percentage?.toFixed(2) ?? "N/A"}%`);
+    lines.push(`  At: ${latestComp.created_at}`);
+  } else {
+    lines.push("Last DB comparison: None");
   }
 
   return lines.join("\n");

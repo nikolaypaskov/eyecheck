@@ -2,8 +2,8 @@ import { z } from "zod";
 import { mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { screenshotUrl } from "../renderers/playwright.js";
-import { compare, analyze } from "../core-bridge.js";
+import { screenshotUrl, screenshotMultipleViewports } from "../renderers/playwright.js";
+import { compare, analyze, type DiffRegion } from "../core-bridge.js";
 import { config, ViewportSchema } from "../config.js";
 import type { ServerState, CheckResult } from "../index.js";
 import { mapValueToToken } from "../tokens.js";
@@ -12,6 +12,18 @@ export const CheckInputSchema = z.object({
   url: z.string().describe("URL to render and compare against reference"),
   selector: z.string().optional().describe("CSS selector to screenshot a specific element"),
   viewport: ViewportSchema.optional(),
+  viewports: z
+    .array(
+      z.object({
+        width: z.number().int().positive(),
+        height: z.number().int().positive(),
+        label: z.string().optional(),
+      }),
+    )
+    .optional()
+    .describe(
+      "Multiple viewports for responsive testing. When provided, tests all viewports and returns aggregated results.",
+    ),
 });
 
 export type CheckInput = z.infer<typeof CheckInputSchema>;
@@ -27,6 +39,93 @@ export async function handleCheck(
   const outDir = path.join(tmpdir(), "eyecheck", "checks");
   await mkdir(outDir, { recursive: true });
   const timestamp = Date.now();
+
+  // Multi-viewport mode
+  if (input.viewports && input.viewports.length > 0) {
+    const screenshots = await screenshotMultipleViewports(
+      input.url,
+      outDir,
+      input.viewports,
+      { selector: input.selector },
+    );
+
+    const vpResults: Array<{
+      label: string;
+      passed: boolean;
+      ssim: number;
+      diffPct: number;
+      issues?: string[];
+    }> = [];
+
+    for (const ss of screenshots) {
+      const label = ss.viewport.label ?? `${ss.viewport.width}x${ss.viewport.height}`;
+      const vpDiffPath = path.join(outDir, `diff-${label}-${timestamp}.png`);
+
+      const cmp = await compare(
+        state.reference.path,
+        ss.outputPath,
+        config.ssimThreshold,
+        vpDiffPath,
+      );
+
+      const entry: (typeof vpResults)[number] = {
+        label,
+        passed: cmp.passed,
+        ssim: cmp.ssim_score,
+        diffPct: cmp.diff_percentage,
+      };
+
+      if (!cmp.passed) {
+        const analysis = await analyze(state.reference.path, ss.outputPath);
+        entry.issues = analysis.issues.map(
+          (issue, i) =>
+            `  ${i + 1}. [${issue.severity.toUpperCase()}] ${issue.issue_type} — ${issue.element}: ${issue.actual}, should be ${issue.expected}`,
+        );
+      }
+
+      vpResults.push(entry);
+    }
+
+    const failCount = vpResults.filter((r) => !r.passed).length;
+    const allPassed = failCount === 0;
+
+    const lines = [`=== Responsive Check: ${input.url} ===`, ""];
+    for (const r of vpResults) {
+      const status = r.passed ? "PASS" : "FAIL";
+      lines.push(
+        `[${r.label}] ${status} — SSIM: ${r.ssim.toFixed(4)} | Diff: ${r.diffPct.toFixed(2)}%`,
+      );
+      if (r.issues) {
+        lines.push(...r.issues);
+      }
+    }
+    lines.push("");
+    lines.push(
+      `Overall: ${allPassed ? "PASS" : "FAIL"} (${failCount} of ${vpResults.length} viewports failed)`,
+    );
+
+    const report = lines.join("\n");
+    const worstSsim = Math.min(...vpResults.map((r) => r.ssim));
+    const worstDiffPct = Math.max(...vpResults.map((r) => r.diffPct));
+
+    state.latestCheck = {
+      passed: allPassed,
+      ssim: worstSsim,
+      diffPercentage: worstDiffPct,
+      url: input.url,
+      checkedAt: new Date().toISOString(),
+      report,
+    };
+    state.scoreHistory.push({
+      ssim: worstSsim,
+      timestamp: state.latestCheck.checkedAt,
+      url: input.url,
+    });
+
+    return report;
+  }
+
+  // Single-viewport mode
   const currentPath = path.join(outDir, `current-${timestamp}.png`);
   const diffPath = path.join(outDir, `diff-${timestamp}.png`);
 
@@ -46,12 +145,15 @@ export async function handleCheck(
 
   let report: string;
 
+  const regionLines = formatRegions(compareResult.regions);
+
   if (compareResult.passed) {
     report = [
       `PASS - Visual check passed`,
       `  SSIM: ${compareResult.ssim_score.toFixed(4)}`,
       `  Threshold: ${config.ssimThreshold}`,
       `  Pixel differences: ${compareResult.diff_pixels} (${compareResult.diff_percentage.toFixed(2)}%)`,
+      ...regionLines,
     ].join("\n");
   } else {
     // Run detailed analysis when below threshold
@@ -80,6 +182,7 @@ export async function handleCheck(
       `  SSIM: ${compareResult.ssim_score.toFixed(4)}`,
       `  Threshold: ${config.ssimThreshold}`,
       `  Pixel differences: ${compareResult.diff_pixels} (${compareResult.diff_percentage.toFixed(2)}%)`,
+      ...regionLines,
       `  Diff image: ${diffPath}`,
       ``,
       `Issues found:`,
@@ -106,4 +209,16 @@ export async function handleCheck(
   });
 
   return report;
+}
+
+function formatRegions(regions: DiffRegion[]): string[] {
+  if (!regions || regions.length === 0) return [];
+  const lines = [`  Regions: ${regions.length} changed areas`];
+  for (let i = 0; i < regions.length; i++) {
+    const r = regions[i];
+    lines.push(
+      `    Region ${i + 1}: (${r.x}, ${r.y}) ${r.width}x${r.height} -- ${r.pixel_count} pixels`,
+    );
+  }
+  return lines;
 }

@@ -5,12 +5,22 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
+export interface DiffRegion {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  pixel_count: number;
+}
+
 export interface CompareResult {
   ssim_score: number;
   passed: boolean;
   diff_pixels: number;
   total_pixels: number;
   diff_percentage: number;
+  antialiased_pixels: number;
+  regions: DiffRegion[];
   diff_image_path?: string;
 }
 
@@ -59,6 +69,7 @@ export async function compare(
   currentPath: string,
   threshold?: number,
   diffOutputPath?: string,
+  ignoreAntialiasing = true,
 ): Promise<CompareResult> {
   const bin = await findBinary();
   const args = ["compare", "--baseline", referencePath, "--test", currentPath];
@@ -68,6 +79,7 @@ export async function compare(
   if (diffOutputPath) {
     args.push("--output", diffOutputPath);
   }
+  args.push("--ignore-antialiasing", ignoreAntialiasing.toString());
   args.push("--json");
 
   const { stdout } = await execFileAsync(bin, args, { timeout: 30_000 });

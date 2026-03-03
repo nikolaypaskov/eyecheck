@@ -1,7 +1,12 @@
 mod analyze;
+mod antialiasing;
+mod batch;
+mod clustering;
 mod compare;
 mod diff_image;
+mod junit;
 mod report;
+mod yiq;
 
 use clap::{Parser, Subcommand};
 
@@ -31,6 +36,10 @@ enum Commands {
         /// Output path for the diff image
         #[arg(long)]
         output: Option<String>,
+
+        /// Ignore anti-aliased pixels in diff count
+        #[arg(long, default_value = "true")]
+        ignore_antialiasing: bool,
 
         /// Output result as JSON
         #[arg(long)]
@@ -74,6 +83,10 @@ enum Commands {
         #[arg(long)]
         output: Option<String>,
 
+        /// Ignore anti-aliased pixels in diff count
+        #[arg(long, default_value = "true")]
+        ignore_antialiasing: bool,
+
         /// Optional context description
         #[arg(long)]
         context: Option<String>,
@@ -81,6 +94,25 @@ enum Commands {
         /// Output result as JSON
         #[arg(long)]
         json: bool,
+    },
+
+    /// Batch comparison for CI/CD pipelines
+    Batch {
+        /// Path to the batch config JSON file
+        #[arg(long)]
+        config: String,
+
+        /// Output directory for diff images
+        #[arg(long)]
+        output_dir: Option<String>,
+
+        /// Output result as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Output JUnit XML report to specified path
+        #[arg(long)]
+        junit: Option<String>,
     },
 }
 
@@ -94,9 +126,11 @@ async fn main() -> anyhow::Result<()> {
             test,
             threshold,
             output,
+            ignore_antialiasing,
             json,
         } => {
-            let result = compare::run(&baseline, &test, threshold, output.as_deref())?;
+            let result =
+                compare::run(&baseline, &test, threshold, output.as_deref(), ignore_antialiasing)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
@@ -121,16 +155,49 @@ async fn main() -> anyhow::Result<()> {
             render,
             threshold,
             output,
+            ignore_antialiasing,
             context,
             json,
         } => {
-            let result =
-                report::run(&reference, &render, threshold, output.as_deref(), context.as_deref())
-                    .await?;
+            let result = report::run(
+                &reference,
+                &render,
+                threshold,
+                output.as_deref(),
+                ignore_antialiasing,
+                context.as_deref(),
+            )
+            .await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
                 print_report(&result);
+            }
+        }
+        Commands::Batch {
+            config,
+            output_dir,
+            json,
+            junit,
+        } => {
+            let result = batch::run(&config, output_dir.as_deref())?;
+
+            if let Some(junit_path) = junit {
+                junit::write_report(&result, &junit_path)?;
+                eprintln!("JUnit report written to: {junit_path}");
+            }
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                batch::print_result(&result);
+            }
+
+            // Exit code: 0 = all pass, 1 = any fail, 2 = any error
+            if result.errors > 0 {
+                std::process::exit(2);
+            } else if result.failed > 0 {
+                std::process::exit(1);
             }
         }
     }
@@ -142,7 +209,22 @@ fn print_compare_result(r: &compare::CompareResult) {
     println!("SSIM Score:      {:.4}", r.ssim_score);
     println!("Passed:          {}", r.passed);
     println!("Diff Pixels:     {}/{}", r.diff_pixels, r.total_pixels);
+    println!("AA Pixels:       {}", r.antialiased_pixels);
     println!("Diff Percentage: {:.2}%", r.diff_percentage);
+    if !r.regions.is_empty() {
+        println!("Regions:         {} changed areas", r.regions.len());
+        for (i, region) in r.regions.iter().enumerate() {
+            println!(
+                "  Region {}: ({}, {}) {}x{} -- {} pixels",
+                i + 1,
+                region.x,
+                region.y,
+                region.width,
+                region.height,
+                region.pixel_count
+            );
+        }
+    }
     if let Some(ref path) = r.diff_image_path {
         println!("Diff Image:      {path}");
     }

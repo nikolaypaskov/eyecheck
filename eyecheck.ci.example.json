@@ -1,0 +1,22 @@
+{
+  "checks": [
+    {
+      "name": "homepage",
+      "baseline": "baselines/homepage.png",
+      "test": "screenshots/homepage.png"
+    },
+    {
+      "name": "about-page",
+      "baseline": "baselines/about.png",
+      "test": "screenshots/about.png"
+    },
+    {
+      "name": "login-form",
+      "baseline": "baselines/login.png",
+      "test": "screenshots/login.png",
+      "threshold": 0.98
+    }
+  ],
+  "threshold": 0.95,
+  "ignore_antialiasing": true
+}

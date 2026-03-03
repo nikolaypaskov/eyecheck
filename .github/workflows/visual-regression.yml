@@ -1,0 +1,112 @@
+# Visual Regression Testing with eyecheck
+# Copy this workflow to your project's .github/workflows/ directory
+#
+# Prerequisites:
+# - Store baselines in your repo (e.g., baselines/ directory)
+# - Create eyecheck.ci.json config file
+# - Set ANTHROPIC_API_KEY secret (only needed for semantic analysis)
+
+name: Visual Regression
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  visual-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build eyecheck-core
+        run: |
+          cargo install --path core
+        working-directory: ${{ github.workspace }}
+
+      - name: Start dev server
+        run: |
+          # Replace with your project's dev server command
+          npm ci
+          npm run dev &
+          # Wait for server to be ready
+          npx wait-on http://localhost:3000 --timeout 30000
+
+      - name: Run visual regression tests
+        id: eyecheck
+        run: |
+          mkdir -p /tmp/eyecheck-diffs
+          eyecheck-core batch \
+            --config eyecheck.ci.json \
+            --output-dir /tmp/eyecheck-diffs \
+            --json > /tmp/eyecheck-results.json
+        continue-on-error: true
+
+      - name: Upload diff images
+        if: failure() || steps.eyecheck.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-diffs
+          path: /tmp/eyecheck-diffs/
+          retention-days: 7
+
+      - name: Comment on PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let results;
+            try {
+              results = JSON.parse(fs.readFileSync('/tmp/eyecheck-results.json', 'utf8'));
+            } catch {
+              return; // No results file
+            }
+
+            const icon = results.failed > 0 ? ':x:' : ':white_check_mark:';
+            let body = `## ${icon} Visual Regression Results\n\n`;
+            body += `| Check | Status | SSIM | Diff |\n`;
+            body += `|-------|--------|------|------|\n`;
+
+            for (const check of results.checks) {
+              const status = check.status === 'pass' ? 'Pass' : check.status === 'fail' ? 'Fail' : 'Error';
+              const ssim = check.ssim_score ? check.ssim_score.toFixed(4) : 'N/A';
+              const diff = check.diff_percentage ? `${check.diff_percentage.toFixed(2)}%` : 'N/A';
+              body += `| ${check.name} | ${status} | ${ssim} | ${diff} |\n`;
+            }
+
+            body += `\n**Total: ${results.total}** | Passed: ${results.passed} | Failed: ${results.failed} | Errors: ${results.errors}`;
+
+            if (results.failed > 0) {
+              body += `\n\n> Diff images uploaded as build artifacts`;
+            }
+
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body?.includes('Visual Regression Results'));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Fail if visual regression detected
+        if: steps.eyecheck.outcome == 'failure'
+        run: exit 1

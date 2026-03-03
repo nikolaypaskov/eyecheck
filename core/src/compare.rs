@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use image::{GenericImageView, GrayImage};
 use image_compare::Algorithm;
+use rayon::prelude::*;
 use serde::Serialize;
 
-use crate::diff_image;
+use crate::{antialiasing, clustering, diff_image, yiq};
 
 #[derive(Debug, Serialize)]
 pub struct CompareResult {
@@ -12,6 +13,8 @@ pub struct CompareResult {
     pub diff_pixels: u64,
     pub total_pixels: u64,
     pub diff_percentage: f64,
+    pub antialiased_pixels: u64,
+    pub regions: Vec<clustering::DiffRegion>,
     pub diff_image_path: Option<String>,
 }
 
@@ -20,6 +23,7 @@ pub fn run(
     test_path: &str,
     threshold: f64,
     output_path: Option<&str>,
+    ignore_antialiasing: bool,
 ) -> Result<CompareResult> {
     let baseline = image::open(baseline_path)
         .with_context(|| format!("Failed to open baseline image: {baseline_path}"))?;
@@ -46,24 +50,65 @@ pub fn run(
             .context("SSIM comparison failed")?;
     let ssim_score = ssim_result.score;
 
-    // RGBA hybrid comparison for color-aware pixel diff
+    // Pixel-level YIQ diff with optional anti-aliasing detection (Rayon parallel by rows)
     let baseline_rgba = baseline.to_rgba8();
     let test_rgba = test.to_rgba8();
 
-    let hybrid_result = image_compare::rgba_hybrid_compare(&baseline_rgba, &test_rgba)
-        .context("RGBA hybrid comparison failed")?;
+    let (width, height) = baseline_rgba.dimensions();
+    let total_pixels = (width as u64) * (height as u64);
 
-    let total_pixels = (baseline.width() as u64) * (baseline.height() as u64);
-    // hybrid_result.score is similarity (1.0 = identical), so diff = 1 - score
-    let diff_fraction = 1.0 - hybrid_result.score;
-    let diff_pixels = (diff_fraction * total_pixels as f64).round() as u64;
-    let diff_percentage = diff_fraction * 100.0;
+    let row_results: Vec<(u64, u64, Vec<bool>)> = (0..height)
+        .into_par_iter()
+        .map(|y| {
+            let mut diff_count = 0u64;
+            let mut aa_count = 0u64;
+            let mut row_mask = Vec::with_capacity(width as usize);
 
+            for x in 0..width {
+                let bp = baseline_rgba.get_pixel(x, y);
+                let tp = test_rgba.get_pixel(x, y);
+
+                if yiq::is_different(
+                    bp[0], bp[1], bp[2], bp[3], tp[0], tp[1], tp[2], tp[3],
+                    yiq::DEFAULT_THRESHOLD,
+                ) {
+                    if ignore_antialiasing
+                        && antialiasing::is_antialiased(&baseline_rgba, &test_rgba, x, y)
+                    {
+                        aa_count += 1;
+                        row_mask.push(false);
+                    } else {
+                        diff_count += 1;
+                        row_mask.push(true);
+                    }
+                } else {
+                    row_mask.push(false);
+                }
+            }
+
+            (diff_count, aa_count, row_mask)
+        })
+        .collect();
+
+    let mut diff_pixels = 0u64;
+    let mut antialiased_pixels = 0u64;
+    let mut diff_mask: Vec<bool> = Vec::with_capacity((width * height) as usize);
+
+    for (dc, ac, row) in row_results {
+        diff_pixels += dc;
+        antialiased_pixels += ac;
+        diff_mask.extend(row);
+    }
+
+    let diff_percentage = (diff_pixels as f64 / total_pixels as f64) * 100.0;
     let passed = ssim_score >= threshold;
+
+    // Find connected regions of diff pixels
+    let regions = clustering::find_regions(&diff_mask, width, height, 4);
 
     // Generate diff overlay image if output requested
     let diff_image_path = if let Some(out) = output_path {
-        diff_image::generate(&baseline_rgba, &test_rgba, out)?;
+        diff_image::generate(&baseline_rgba, &test_rgba, out, ignore_antialiasing, &diff_mask, &regions)?;
         Some(out.to_string())
     } else {
         None
@@ -75,6 +120,8 @@ pub fn run(
         diff_pixels,
         total_pixels,
         diff_percentage,
+        antialiased_pixels,
+        regions,
         diff_image_path,
     })
 }
@@ -108,10 +155,11 @@ mod tests {
         save_solid_image(&baseline, 0, 0, 255, 100);
         save_solid_image(&test_img, 0, 0, 255, 100);
 
-        let result = run(&baseline, &test_img, 0.95, None).unwrap();
+        let result = run(&baseline, &test_img, 0.95, None, true).unwrap();
         assert!(result.ssim_score > 0.99, "SSIM should be ~1.0 for identical images, got {}", result.ssim_score);
         assert!(result.passed, "Should pass with identical images");
         assert_eq!(result.diff_percentage, 0.0, "No pixel differences expected");
+        assert!(result.regions.is_empty(), "No regions expected for identical images");
     }
 
     #[test]
@@ -123,9 +171,10 @@ mod tests {
         save_solid_image(&baseline, 0, 0, 255, 100);  // blue
         save_solid_image(&test_img, 255, 0, 0, 100);   // red
 
-        let result = run(&baseline, &test_img, 0.95, None).unwrap();
+        let result = run(&baseline, &test_img, 0.95, None, true).unwrap();
         assert!(result.ssim_score < 0.95, "SSIM should be below threshold for different images, got {}", result.ssim_score);
         assert!(!result.passed, "Should fail with different images");
+        assert!(!result.regions.is_empty(), "Should have regions for different images");
     }
 
     #[test]
@@ -137,7 +186,7 @@ mod tests {
         save_solid_image(&baseline, 0, 0, 255, 100);  // blue
         save_solid_image(&test_img, 255, 0, 0, 100);   // red
 
-        let result = run(&baseline, &test_img, 0.95, None).unwrap();
+        let result = run(&baseline, &test_img, 0.95, None, true).unwrap();
         assert!(result.diff_pixels > 0, "Should have diff pixels for different images");
         assert!(result.diff_percentage > 0.0, "Should have non-zero diff percentage");
         assert_eq!(result.total_pixels, 10000, "100x100 image should have 10000 pixels");
@@ -153,7 +202,7 @@ mod tests {
         save_solid_image(&baseline, 0, 0, 255, 100);
         save_solid_image(&test_img, 255, 0, 0, 100);
 
-        let result = run(&baseline, &test_img, 0.95, Some(&diff_out)).unwrap();
+        let result = run(&baseline, &test_img, 0.95, Some(&diff_out), true).unwrap();
         assert!(result.diff_image_path.is_some(), "Should have diff image path");
         assert!(std::path::Path::new(&diff_out).exists(), "Diff image file should exist");
     }

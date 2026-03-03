@@ -7,8 +7,12 @@ import { CheckInputSchema, handleCheck } from "./tools/check.js";
 import { WatchInputSchema, handleWatch, stopWatch } from "./tools/watch.js";
 import { handleStatus } from "./tools/status.js";
 import { SetTokensInputSchema, handleSetTokens } from "./tools/set-tokens.js";
+import { ApproveInputSchema, handleApprove } from "./tools/approve.js";
+import { HistoryInputSchema, handleHistory } from "./tools/history.js";
+import { initDb, getLatestBaseline } from "./storage.js";
 import type { TokenMap } from "./tokens.js";
 import { closeBrowser } from "./renderers/playwright.js";
+import { existsSync } from "node:fs";
 
 export interface ReferenceInfo {
   type: "url" | "file" | "screenshot";
@@ -65,8 +69,8 @@ server.tool(
   "set_reference",
   "Store a design reference image for visual comparison. Accepts a URL to screenshot, a local file path, or a localhost URL.",
   SetReferenceInputSchema.shape,
-  async ({ type, value, viewport }) => {
-    const result = await handleSetReference({ type, value, viewport }, state);
+  async ({ type, value, viewport, name }) => {
+    const result = await handleSetReference({ type, value, viewport, name }, state);
     return { content: [{ type: "text" as const, text: result }] };
   },
 );
@@ -75,8 +79,8 @@ server.tool(
   "check",
   "Render a URL and compare it against the stored reference image. Reports SSIM score, pixel differences, and detailed analysis of visual discrepancies.",
   CheckInputSchema.shape,
-  async ({ url, selector, viewport }) => {
-    const result = await handleCheck({ url, selector, viewport }, state);
+  async ({ url, selector, viewport, viewports }) => {
+    const result = await handleCheck({ url, selector, viewport, viewports }, state);
     return { content: [{ type: "text" as const, text: result }] };
   },
 );
@@ -111,7 +115,45 @@ server.tool(
   },
 );
 
+server.tool(
+  "approve",
+  "Approve the latest check result as the new baseline. Replaces the current reference with the most recent test render.",
+  ApproveInputSchema.shape,
+  async ({ name }) => {
+    const result = await handleApprove({ name }, state);
+    return { content: [{ type: "text" as const, text: result }] };
+  },
+);
+
+server.tool(
+  "history",
+  "View comparison history for a named baseline. Shows SSIM scores, pass/fail status, and diff percentages over time.",
+  HistoryInputSchema.shape,
+  async ({ name, limit }) => {
+    const result = await handleHistory({ name, limit });
+    return { content: [{ type: "text" as const, text: result }] };
+  },
+);
+
 async function main() {
+  // Initialize SQLite database
+  initDb();
+
+  // Restore latest baseline from DB into in-memory state for session continuity
+  const latestBaseline = getLatestBaseline();
+  if (latestBaseline && existsSync(latestBaseline.image_path)) {
+    state.reference = {
+      type: latestBaseline.url ? "url" : "file",
+      source: latestBaseline.url ?? latestBaseline.image_path,
+      path: latestBaseline.image_path,
+      dimensions: {
+        width: latestBaseline.viewport_width,
+        height: latestBaseline.viewport_height,
+      },
+      setAt: latestBaseline.updated_at,
+    };
+  }
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
