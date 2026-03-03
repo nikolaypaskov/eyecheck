@@ -1,0 +1,25 @@
+# Rust
+/core/target/
+**/*.rs.bk
+
+# Node
+/mcp-server/node_modules/
+/mcp-server/dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+
+# Test artifacts
+/test/output/
+*.diff.png
